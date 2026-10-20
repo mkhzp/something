@@ -20,11 +20,12 @@ permissions:
 
 concurrency:
   group: oracle-grab
+  cancel-in-progress: false
 
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       OCI_CLI_REGION: me-dubai-1
@@ -87,3 +88,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow disable oracle-grab.yml --repo "$GITHUB_REPOSITORY"
+
+      # GitHub's schedule is unreliable (it can skip or delay runs for a long time), so each
+      # run also starts the next one about 4 minutes after it finishes. The cron above is
+      # a backup that restarts the chain if it ever breaks.
+      - name: Start the next attempt
+        if: steps.grab.outcome == 'success' && steps.grab.outputs.done != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 240
+          gh workflow run oracle-grab.yml --repo "$GITHUB_REPOSITORY" --ref main
