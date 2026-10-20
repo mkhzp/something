@@ -1,0 +1,90 @@
+name: Oracle server grab
+
+# Tries to create the free Oracle Arm server (VM.Standard.A1.Flex) in Dubai until
+# Oracle has capacity, then turns itself off. Temporary: delete this file once the
+# server exists. Each run makes at most two launch attempts and takes about a minute.
+# Public repo, so Actions minutes are free; logs show only short Oracle errors.
+# Secrets (Oracle console, profile, API keys, "Add API key"):
+#   OCI_USER, OCI_TENANCY, OCI_FINGERPRINT  values from the config preview Oracle shows
+#   OCI_KEY                                 the downloaded private API key (.pem), whole file
+#   OCI_SSH_PUBKEY                          contents of ~/pochita_key.pub from Cloud Shell
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: oracle-grab
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      OCI_CLI_REGION: me-dubai-1
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Set up the Oracle CLI
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          OCI_SSH_PUBKEY: ${{ secrets.OCI_SSH_PUBKEY }}
+        run: |
+          for v in OCI_USER OCI_TENANCY OCI_FINGERPRINT OCI_KEY OCI_SSH_PUBKEY; do
+            if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; exit 1; fi
+          done
+          pip install -q oci-cli
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          printf '%s\n' "$OCI_SSH_PUBKEY" > ~/.oci/ssh.pub
+          chmod 600 ~/.oci/key.pem
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=me-dubai-1\nkey_file=%s\n' \
+            "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$HOME/.oci/key.pem" > ~/.oci/config
+          chmod 600 ~/.oci/config
+          echo "T=$OCI_TENANCY" >> "$GITHUB_ENV"
+
+      - name: Try to create the server
+        id: grab
+        run: |
+          existing=$(oci compute instance list --compartment-id "$T" --display-name pochita \
+            --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" --raw-output)
+          if [ "${existing:-0}" != "0" ]; then
+            echo "A pochita server already exists."; echo "done=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          AD=$(oci iam availability-domain list --compartment-id "$T" --query 'data[0].name' --raw-output)
+          SUBNET=$(oci network subnet list --compartment-id "$T" --query 'data[0].id' --raw-output)
+          IMAGE=$(oci compute image list --compartment-id "$T" --operating-system "Canonical Ubuntu" \
+            --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --query 'data[0].id' --raw-output)
+          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then echo "::error::no subnet or image found"; exit 1; fi
+          for SIZE in "2 12" "1 6"; do
+            set -- $SIZE
+            OUT=$(oci compute instance launch --availability-domain "$AD" --compartment-id "$T" \
+              --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$1,\"memoryInGBs\":$2}" \
+              --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+              --ssh-authorized-keys-file ~/.oci/ssh.pub --boot-volume-size-in-gbs 100 \
+              --display-name pochita --no-retry 2>&1) || true
+            if echo "$OUT" | grep -q '"lifecycle-state"'; then
+              echo "::notice::CREATED with $1 OCPU / $2 GB. Find its IP under Compute, Instances."
+              echo "done=1" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            echo "$1 OCPU/$2 GB: $(echo "$OUT" | grep -oiE 'out of host capacity|LimitExceeded|TooManyRequests|NotAuthenticated|NotAuthorized[^"]*' | head -1)"
+            echo "$OUT" | grep -qiE 'NotAuthenticated|NotAuthorized|LimitExceeded' && { echo "$OUT" | grep -m2 '"message"'; exit 1; }
+            sleep 60
+          done
+          echo "No capacity this time; the next run tries again."
+
+      - name: Turn this workflow off once the server exists
+        if: steps.grab.outputs.done == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable oracle-grab.yml --repo "$GITHUB_REPOSITORY"
